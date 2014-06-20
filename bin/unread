@@ -1,0 +1,196 @@
+#!/usr/bin/env python
+
+"""
+Unread: Page through personal twitter feed from last unread
+
+Usage:
+    unread pull
+    unread read
+    unread dump <key>
+    unread show <key>
+"""
+
+
+__version__ = '0.1'
+
+
+import itertools
+import bsddb
+import json
+import sys
+import os
+
+
+from ConfigParser import ConfigParser
+from datetime import datetime
+from pprint import pprint
+
+
+import humanize
+
+
+from twitter import Twitter, OAuth
+from blessed import Terminal
+from docopt import docopt
+
+
+class Config(object):
+    """
+    # creds expected in ~/.unread/auth
+    [auth]
+    CONSUMER_KEY = ...
+    CONSUMER_SECRET = ...
+    OAUTH_TOKEN = ...
+    OAUTH_SECRET = ...
+    """
+    def __init__(self):
+        self.config = ConfigParser()
+        self.config.read([os.path.expanduser('~/.unread/auth')])
+
+    def __getattr__(self, name):
+        return self.config.get('auth', name)
+
+
+C = Config()
+
+
+class Record(object):
+    def __init__(self, record):
+        self.data = record
+
+    @property
+    def ago(self):
+        # Wed Jun 11 23:53:55 +0000 2014
+        created = datetime.strptime(
+            self.data['created_at'], '%a %b %d %H:%M:%S +0000 %Y')
+        return humanize.naturaltime(datetime.utcnow() - created)
+
+    def dump(self):
+        pprint(self.data)
+
+    def show(self):
+        t = Terminal()
+
+        if 'retweeted_status' in self:
+            text = 'RT @%s: %s' % (
+                t.yellow(self.retweeted_status['user']['screen_name']),
+                t.cyan(self.retweeted_status['text']))
+        else:
+            text = t.cyan(self.text)
+
+        print '@%-20s %-20s %s' % (
+            t.yellow(self.user['screen_name']),
+            self.ago,
+            self.id)
+
+        def fmt(text):
+            lines = t.wrap(
+                text,
+                width=70,
+                initial_indent='  - ',
+                subsequent_indent='    ')
+            # seems to be a bug in blessed's wrap
+            if len(lines) == 2 and lines[1][2] == '-':
+                del lines[1]
+            return '\n'.join(lines)
+
+        print fmt(text)
+        print
+
+    def __getattr__(self, name):
+        return self.data[name]
+
+    def __getitem__(self, name):
+        return self.data[name]
+
+    def __contains__(self, name):
+        return name in self.data
+
+
+class DB(object):
+
+    READ_KEY = '00__last_read__'
+
+    def __init__(self):
+        self.db = bsddb.btopen(os.path.expanduser('~/.unread/db'))
+
+    def __getitem__(self, key):
+        return Record(json.loads(self.db[key]))
+
+    def pull(self):
+        auth = OAuth(
+            C.OAUTH_TOKEN, C.OAUTH_SECRET, C.CONSUMER_KEY, C.CONSUMER_SECRET)
+        t = Twitter(auth=auth)
+
+        print "DB:", len(self.db)
+        key, record = self.db.last()
+        record = json.loads(record)
+
+        max_id = None
+
+        while True:
+            if max_id:
+                data = t.statuses.home_timeline(
+                    since_id=record['id'], max_id=max_id)
+            else:
+                data = t.statuses.home_timeline(since_id=record['id'])
+
+            for item in data:
+                self.db[str(item['id'])] = json.dumps(item)
+
+            if len(data) < 20:
+                break
+
+            max_id = data[-1]['id']
+
+        print "DB:", len(self.db)
+        self.db.sync()
+
+    def scan(self):
+        if self.READ_KEY not in self.db:
+            key, record = self.db.first()
+        else:
+            key, record = self.db.set_location(self.db[self.READ_KEY])
+
+        yield key, Record(json.loads(record))
+
+        while True:
+            try:
+                key, record = self.db.next()
+                yield key, Record(json.loads(record))
+            except bsddb._bsddb.DBNotFoundError:
+                break
+
+    def unread(self):
+        return len(list(self.scan())) - 1
+
+    def mark_read(self, key):
+        self.db[self.READ_KEY] = key
+        self.db.sync()
+
+
+def main(argv):
+    db = DB()
+
+    if argv['pull']:
+        db.pull()
+        return
+
+    if argv['dump']:
+        db[argv['<key>']].dump()
+        return
+
+    if argv['show']:
+        db[argv['<key>']].show()
+        return
+
+    if argv['read']:
+        for key, record in itertools.islice(db.scan(), 8):
+            record.show()
+        db.mark_read(key)
+        print db.unread(), 'to go'
+
+
+if __name__ == '__main__':
+    argv = docopt(__doc__, version=__version__)
+    sys.exit(main(argv))
