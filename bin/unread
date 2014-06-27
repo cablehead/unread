@@ -90,9 +90,14 @@ class Record(object):
                 initial_indent='  - ',
                 subsequent_indent='    ')
             # seems to be a bug in blessed's wrap
-            if len(lines) == 2 and lines[1][2] == '-':
-                del lines[1]
-            return '\n'.join(lines)
+            clean = [lines[0]]
+            for line in lines[1:]:
+                if not line:
+                    continue
+                if line[2] == '-':
+                    break
+                clean.append(line)
+            return '\n'.join(clean)
 
         print fmt(text)
         print
